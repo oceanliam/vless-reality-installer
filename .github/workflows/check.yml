@@ -18,7 +18,10 @@ jobs:
       - name: Bash 语法检查
         run: bash -n install.sh tests/*.sh
       - name: ShellCheck
-        run: shellcheck install.sh tests/*.sh
+        run: |
+          shellcheck install.sh tests/run.sh tests/static-check.sh tests/test-static-check.sh tests/test-ci-workflow.sh
+          # 行为测试会在子 shell 中覆盖函数，ShellCheck 无法静态追踪这类间接调用。
+          shellcheck -e SC2317 tests/test-installer.sh
       - name: 安全与行为测试
         run: bash tests/run.sh
 
@@ -37,9 +40,10 @@ jobs:
         run: |
           if command -v apt-get >/dev/null 2>&1; then
             apt-get update
-            apt-get install -y --no-install-recommends bash coreutils grep sed git
+            apt-get install -y --no-install-recommends bash coreutils grep sed git ca-certificates
           else
-            dnf install -y bash coreutils grep sed git
+            # Rocky 容器预装 coreutils-single，安装 coreutils 会产生包冲突。
+            dnf install -y bash grep sed git ca-certificates
           fi
       - uses: actions/checkout@v4
       - name: 运行静态和行为测试
