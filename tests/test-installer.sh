@@ -680,7 +680,7 @@ test_client_output_is_mode_0600() (
   PUBLIC_KEY="$(printf '%043d' 8)"
   SHORT_ID='0123456789abcdef'
   write_client_output
-  [[ "$(stat -f '%Lp' "${target}" 2>/dev/null || stat -c '%a' "${target}")" == '600' ]] || { printf 'client output mode is not 0600'; return 1; }
+  [[ "$(stat -c '%a' "${target}" 2>/dev/null || stat -f '%Lp' "${target}")" == '600' ]] || { printf 'client output mode is not 0600'; return 1; }
   grep -q '^vless://' "${target}" || { printf 'share URI missing from client output'; return 1; }
   rm -rf "${temp_dir}"
 )
