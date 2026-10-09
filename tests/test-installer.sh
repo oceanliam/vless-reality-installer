@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 
+# Test doubles are intentionally resolved dynamically after sourcing install.sh.
+# shellcheck disable=SC1091,SC2034,SC2329
+
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

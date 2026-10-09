@@ -86,7 +86,8 @@ detect_platform() {
 preflight_platform() {
   require_root || return
   systemd_is_running || { die "仅支持使用 systemd 的 Linux。"; return 1; }
-  detect_platform
+  detect_platform || return
+  log "检测到 ${OS_FAMILY} 系统，Xray 架构为 ${ARCH}。"
 }
 
 install_dependencies() {
@@ -535,8 +536,8 @@ verify_listener() {
 }
 
 choose_local_socks_port() {
-  local attempt port
-  for attempt in {1..30}; do
+  local port
+  for _ in {1..30}; do
     port=$((20000 + RANDOM % 30000))
     if ! ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
       printf '%s\n' "${port}"
@@ -553,8 +554,8 @@ start_e2e_client() {
 }
 
 wait_for_local_port() {
-  local port="$1" attempt
-  for attempt in {1..40}; do
+  local port="$1"
+  for _ in {1..40}; do
     if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
       return 0
     fi

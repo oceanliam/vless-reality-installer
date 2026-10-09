@@ -1,0 +1,49 @@
+name: 检查
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 安装 ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Bash 语法检查
+        run: bash -n install.sh tests/*.sh
+      - name: ShellCheck
+        run: shellcheck install.sh tests/*.sh
+      - name: 安全与行为测试
+        run: bash tests/run.sh
+
+  distribution-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - ubuntu:24.04
+          - rockylinux:9
+    container: ${{ matrix.container }}
+    steps:
+      - name: 安装测试依赖
+        shell: bash
+        run: |
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends bash coreutils grep sed git
+          else
+            dnf install -y bash coreutils grep sed git
+          fi
+      - uses: actions/checkout@v4
+      - name: 运行静态和行为测试
+        shell: bash
+        run: |
+          bash -n install.sh tests/*.sh
+          bash tests/run.sh
