@@ -321,6 +321,138 @@ test_restore_service_states_exactly() (
   rm -rf "${temp_dir}"
 )
 
+test_downloads_official_installer_to_mktemp() (
+  local temp_root calls=""
+  declare -F run_official_xray_installer >/dev/null || { printf 'run_official_xray_installer is not defined'; return 1; }
+  temp_root="$(mktemp -d)"
+  make_temp_dir() { mkdir -p "${temp_root}/download"; printf '%s\n' "${temp_root}/download"; }
+  download_file() { calls+="download:$1:$2|"; printf '#!/usr/bin/env bash\n' >"$2"; }
+  execute_installer_script() { calls+="execute:$*|"; }
+  run_official_xray_installer
+  [[ "${calls}" == download:https://github.com/XTLS/Xray-install/raw/main/install-release.sh:* ]] || { printf 'wrong official URL: %s' "${calls}"; return 1; }
+  [[ "${calls}" == *'|execute:'*'/install-release.sh install --without-geodata|' ]] || { printf 'downloaded script was not executed with expected args: %s' "${calls}"; return 1; }
+  [[ ! -d "${temp_root}/download" ]] || { printf 'temporary installer directory not cleaned'; return 1; }
+  rm -rf "${temp_root}"
+)
+
+test_does_not_pipe_curl_to_shell() (
+  local temp_root order=""
+  declare -F run_official_xray_installer >/dev/null || { printf 'run_official_xray_installer is not defined'; return 1; }
+  temp_root="$(mktemp -d)"
+  make_temp_dir() { mkdir -p "${temp_root}/download"; printf '%s\n' "${temp_root}/download"; }
+  download_file() { order+="download|"; printf '#!/usr/bin/env bash\n' >"$2"; }
+  execute_installer_script() { [[ -f "$1" ]] || return 1; order+="execute|"; }
+  run_official_xray_installer
+  [[ "${order}" == 'download|execute|' ]] || { printf 'installer was not downloaded before execution: %s' "${order}"; return 1; }
+  rm -rf "${temp_root}"
+)
+
+test_existing_xray_is_not_restarted_before_switch() (
+  local installs=0 actions=""
+  declare -F ensure_xray_binary >/dev/null || { printf 'ensure_xray_binary is not defined'; return 1; }
+  xray_is_usable() { return 0; }
+  run_official_xray_installer() { installs=$((installs + 1)); }
+  run_systemctl() { actions+="$*|"; }
+  ensure_xray_binary
+  [[ "${installs}" -eq 0 ]] || { printf 'existing Xray was upgraded early'; return 1; }
+  [[ -z "${actions}" ]] || { printf 'existing Xray service was changed: %s' "${actions}"; return 1; }
+  [[ "${XRAY_WAS_PRESENT}" == "1" ]] || { printf 'existing Xray not recorded'; return 1; }
+)
+
+test_fresh_install_does_not_touch_other_443_service() (
+  local attempts=0 actions=""
+  declare -F ensure_xray_binary >/dev/null || { printf 'ensure_xray_binary is not defined'; return 1; }
+  xray_is_usable() { attempts=$((attempts + 1)); ((attempts > 1)); }
+  run_official_xray_installer() { :; }
+  run_systemctl() { actions+="$*|"; }
+  ensure_xray_binary
+  [[ "${actions}" == 'stop xray.service|disable xray.service|' ]] || { printf 'unexpected service changes: %s' "${actions}"; return 1; }
+  [[ "${XRAY_WAS_PRESENT}" == "0" ]] || { printf 'fresh Xray state not recorded'; return 1; }
+)
+
+test_credentials_have_expected_shapes() (
+  declare -F generate_credentials >/dev/null || { printf 'generate_credentials is not defined'; return 1; }
+  run_xray() {
+    if [[ "$1" == 'uuid' ]]; then
+      printf '123e4567-e89b-42d3-a456-426614174000\n'
+    else
+      printf 'PrivateKey: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nPassword: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n'
+    fi
+  }
+  generate_short_id() { printf '0123456789abcdef\n'; }
+  generate_credentials
+  [[ "${UUID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || { printf 'UUID shape invalid'; return 1; }
+  [[ "${PRIVATE_KEY}" =~ ^[A-Za-z0-9_-]{43}$ ]] || { printf 'private key shape invalid'; return 1; }
+  [[ "${PUBLIC_KEY}" =~ ^[A-Za-z0-9_-]{43}$ ]] || { printf 'public key shape invalid'; return 1; }
+  [[ "${SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || { printf 'short ID shape invalid'; return 1; }
+)
+
+test_two_runs_rotate_all_credentials() (
+  local temp_dir first second
+  declare -F generate_credentials >/dev/null || { printf 'generate_credentials is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  printf '0' >"${temp_dir}/counter"
+  run_xray() {
+    local count
+    count="$(cat "${temp_dir}/counter")"
+    if [[ "$1" == 'uuid' ]]; then
+      if [[ "${count}" == '0' ]]; then
+        printf '123e4567-e89b-42d3-a456-426614174000\n'
+      else
+        printf '223e4567-e89b-42d3-a456-426614174001\n'
+      fi
+    else
+      if [[ "${count}" == '0' ]]; then
+        printf 'Private key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nPublic key: BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n'
+      else
+        printf 'Private key: CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\nPublic key: DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\n'
+      fi
+      printf '%s' "$((count + 1))" >"${temp_dir}/counter"
+    fi
+  }
+  generate_short_id() { [[ "$(cat "${temp_dir}/counter")" == '1' ]] && printf '1111111111111111\n' || printf '2222222222222222\n'; }
+  generate_credentials
+  first="${UUID}|${PRIVATE_KEY}|${PUBLIC_KEY}|${SHORT_ID}"
+  generate_credentials
+  second="${UUID}|${PRIVATE_KEY}|${PUBLIC_KEY}|${SHORT_ID}"
+  [[ "${first}" != "${second}" ]] || { printf 'credentials were reused'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_private_key_never_appears_in_git_files() (
+  local temp_dir
+  declare -F render_staged_server_config >/dev/null || { printf 'render_staged_server_config is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  BACKUP_DIR="${temp_dir}/backup"
+  mkdir -p "${BACKUP_DIR}"
+  UUID='123e4567-e89b-42d3-a456-426614174000'
+  PRIVATE_KEY="$(printf '%043d' 7)"
+  PUBLIC_KEY="$(printf '%043d' 8)"
+  SHORT_ID='abcdef0123456789'
+  render_staged_server_config
+  [[ -f "${BACKUP_DIR}/staged-config.json" ]] || { printf 'staged config missing'; return 1; }
+  if git -C "${REPO_ROOT}" grep -Fq "${PRIVATE_KEY}"; then
+    printf 'generated private key leaked into tracked files'
+    return 1
+  fi
+  grep -q '"port": 443' "${BACKUP_DIR}/staged-config.json" || { printf 'fixed port missing'; return 1; }
+  grep -q '"network": "raw"' "${BACKUP_DIR}/staged-config.json" || { printf 'raw transport missing'; return 1; }
+  grep -q '"target": "www.bing.com:443"' "${BACKUP_DIR}/staged-config.json" || { printf 'target missing'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_staged_config_is_validated_in_place() (
+  local temp_dir args=""
+  declare -F validate_staged_server_config >/dev/null || { printf 'validate_staged_server_config is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  STAGED_CONFIG="${temp_dir}/staged-config.json"
+  printf '{}\n' >"${STAGED_CONFIG}"
+  run_xray() { args="$*"; }
+  validate_staged_server_config
+  [[ "${args}" == "run -test -config ${STAGED_CONFIG}" ]] || { printf 'unexpected validation args: %s' "${args}"; return 1; }
+  rm -rf "${temp_dir}"
+)
+
 run_platform_tests() {
   run_isolated_test test_non_root_stops_before_mutation "non-root rejected before mutation"
   run_isolated_test test_rejects_non_systemd "non-systemd rejected before mutation"
@@ -348,6 +480,17 @@ run_port_tests() {
   run_isolated_test test_restore_service_states_exactly "service states restore exactly"
 }
 
+run_xray_prepare_tests() {
+  run_isolated_test test_downloads_official_installer_to_mktemp "official installer is downloaded locally"
+  run_isolated_test test_does_not_pipe_curl_to_shell "installer download precedes execution"
+  run_isolated_test test_existing_xray_is_not_restarted_before_switch "existing Xray is not restarted early"
+  run_isolated_test test_fresh_install_does_not_touch_other_443_service "fresh Xray install only stops Xray"
+  run_isolated_test test_credentials_have_expected_shapes "generated credentials have valid shapes"
+  run_isolated_test test_two_runs_rotate_all_credentials "repeated runs rotate credentials"
+  run_isolated_test test_private_key_never_appears_in_git_files "private key remains outside repository"
+  run_isolated_test test_staged_config_is_validated_in_place "staged config is validated in place"
+}
+
 test_source_does_not_run_main() {
   local output
   if [[ ! -f "${INSTALLER}" ]]; then
@@ -371,6 +514,9 @@ case "${1:-all}" in
   port)
     run_port_tests
     ;;
+  xray_prepare)
+    run_xray_prepare_tests
+    ;;
   all)
     test_constants_are_fixed
     test_source_does_not_run_main
@@ -378,6 +524,7 @@ case "${1:-all}" in
     run_network_tests
     run_backup_tests
     run_port_tests
+    run_xray_prepare_tests
     ;;
   *)
     fail "test selector" "unknown selector: $1"

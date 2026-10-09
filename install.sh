@@ -332,6 +332,136 @@ restore_service_states() {
   done <"${SERVICE_STATE_FILE}"
 }
 
+make_temp_dir() {
+  mktemp -d
+}
+
+download_file() {
+  local url="$1" output="$2"
+  curl -fsSL --connect-timeout 10 --max-time 120 "${url}" -o "${output}"
+}
+
+execute_installer_script() {
+  bash "$@"
+}
+
+run_official_xray_installer() {
+  local temp_dir installer status=0
+  temp_dir="$(make_temp_dir)"
+  installer="${temp_dir}/install-release.sh"
+  trap 'rm -rf "${temp_dir}"' RETURN
+
+  download_file \
+    https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
+    "${installer}" || status=$?
+  if ((status == 0)); then
+    execute_installer_script "${installer}" install --without-geodata "$@" || status=$?
+  fi
+
+  rm -rf "${temp_dir}"
+  trap - RETURN
+  return "${status}"
+}
+
+locate_xray_binary() {
+  if command_exists xray; then
+    command -v xray
+  elif [[ -x /usr/local/bin/xray ]]; then
+    printf '/usr/local/bin/xray\n'
+  else
+    return 1
+  fi
+}
+
+run_xray() {
+  "${XRAY_BIN:-/usr/local/bin/xray}" "$@"
+}
+
+xray_is_usable() {
+  local binary
+  binary="$(locate_xray_binary)" || return 1
+  XRAY_BIN="${binary}"
+  run_xray version >/dev/null 2>&1 || return 1
+  run_xray uuid >/dev/null 2>&1 || return 1
+  run_xray x25519 >/dev/null 2>&1 || return 1
+}
+
+ensure_xray_binary() {
+  if xray_is_usable; then
+    XRAY_WAS_PRESENT="1"
+    return 0
+  fi
+
+  XRAY_WAS_PRESENT="0"
+  run_official_xray_installer || return
+  xray_is_usable || { die "Xray 安装后仍无法执行。"; return 1; }
+  run_systemctl stop xray.service
+  run_systemctl disable xray.service
+}
+
+generate_short_id() {
+  openssl rand -hex 8
+}
+
+generate_credentials() {
+  local x25519_output
+  UUID="$(run_xray uuid | tr '[:upper:]' '[:lower:]')" || return
+  x25519_output="$(run_xray x25519)" || return
+  PRIVATE_KEY="$(awk -F ': *' '/^(PrivateKey|Private key):/{print $2; exit}' <<<"${x25519_output}")"
+  PUBLIC_KEY="$(awk -F ': *' '/^(PublicKey|Public key|Password):/{print $2; exit}' <<<"${x25519_output}")"
+  SHORT_ID="$(generate_short_id | tr '[:upper:]' '[:lower:]')" || return
+
+  [[ "${UUID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || {
+    die "Xray 生成的 UUID 格式无效。"
+    return 1
+  }
+  [[ "${PRIVATE_KEY}" =~ ^[A-Za-z0-9_-]{43}$ ]] || { die "REALITY 私钥格式无效。"; return 1; }
+  [[ "${PUBLIC_KEY}" =~ ^[A-Za-z0-9_-]{43}$ ]] || { die "REALITY 公钥格式无效。"; return 1; }
+  [[ "${SHORT_ID}" =~ ^[0-9a-f]{16}$ ]] || { die "REALITY Short ID 格式无效。"; return 1; }
+}
+
+render_staged_server_config() {
+  [[ -n "${BACKUP_DIR:-}" ]] || { die "未创建备份目录。"; return 1; }
+  STAGED_CONFIG="${BACKUP_DIR}/staged-config.json"
+  umask 077
+  command cat >"${STAGED_CONFIG}" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": ${XRAY_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {"id": "${UUID}", "flow": "xtls-rprx-vision"}
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "${REALITY_DEST}",
+          "xver": 0,
+          "serverNames": ["${REALITY_HOST}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SHORT_ID}"]
+        }
+      }
+    }
+  ],
+  "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+}
+EOF
+}
+
+validate_staged_server_config() {
+  [[ -f "${STAGED_CONFIG:-}" ]] || { die "待校验的 Xray 配置不存在。"; return 1; }
+  run_xray run -test -config "${STAGED_CONFIG}"
+}
+
 main() {
   :
 }
