@@ -221,13 +221,29 @@ backup_existing_state() {
   )
 
   [[ -n "${BACKUP_DIR:-}" ]] || { die "未创建备份目录。"; return 1; }
+  BACKUP_PATH_STATE_FILE="${BACKUP_DIR}/path-states.tsv"
+  : >"${BACKUP_PATH_STATE_FILE}"
   for path in "${paths[@]}"; do
+    if [[ -e "$(root_path "${path}")" || -L "$(root_path "${path}")" ]]; then
+      printf '%s\tpresent\n' "${path}" >>"${BACKUP_PATH_STATE_FILE}"
+    else
+      printf '%s\tabsent\n' "${path}" >>"${BACKUP_PATH_STATE_FILE}"
+    fi
     backup_one_path "${path}"
   done
+  if service_unit_exists xray.service; then
+    capture_service_state xray.service
+  fi
 }
 
 run_systemctl() {
   systemctl "$@"
+}
+
+service_unit_exists() {
+  local load_state
+  load_state="$(run_systemctl show --property=LoadState --value "$1" 2>/dev/null)" || return 1
+  [[ -n "${load_state}" && "${load_state}" != "not-found" ]]
 }
 
 get_port_443_pids() {
@@ -462,8 +478,263 @@ validate_staged_server_config() {
   run_xray run -test -config "${STAGED_CONFIG}"
 }
 
+xray_service_user() {
+  local user
+  user="$(run_systemctl show --property=User --value xray.service 2>/dev/null || true)"
+  printf '%s\n' "${user:-root}"
+}
+
+xray_service_group() {
+  local user group
+  user="$(xray_service_user)"
+  group="$(id -gn "${user}" 2>/dev/null)" || return 1
+  printf '%s\n' "${group}"
+}
+
+install_staged_server_config() {
+  local target="${XRAY_CONFIG_PATH:-/usr/local/etc/xray/config.json}"
+  local target_dir temp_file group
+  [[ -f "${STAGED_CONFIG:-}" ]] || { die "待安装的 Xray 配置不存在。"; return 1; }
+  target_dir="$(dirname "${target}")"
+  group="$(xray_service_group)" || { die "无法确定 Xray 服务账户组。"; return 1; }
+  install -d -m 0750 -o root -g "${group}" "${target_dir}"
+  temp_file="$(mktemp "${target_dir}/.config.json.XXXXXX")"
+  install -m 0640 -o root -g "${group}" "${STAGED_CONFIG}" "${temp_file}"
+  mv -f "${temp_file}" "${target}"
+}
+
+upgrade_existing_xray() {
+  [[ "${XRAY_WAS_PRESENT:-0}" == "1" ]] || return 0
+  run_official_xray_installer --no-update-service
+  xray_is_usable || { die "Xray 升级后无法执行。"; return 1; }
+}
+
+activate_xray() {
+  run_systemctl enable xray.service
+  run_systemctl restart xray.service
+  run_systemctl is-active --quiet xray.service || { die "xray.service 未运行。"; return 1; }
+  run_systemctl is-enabled --quiet xray.service || { die "xray.service 未启用开机启动。"; return 1; }
+}
+
+pid_is_xray() {
+  local pid="$1" proc_root="${PROC_ROOT:-/proc}" executable
+  executable="$(readlink "${proc_root}/${pid}/exe" 2>/dev/null || true)"
+  [[ "$(basename "${executable}")" == "xray" ]]
+}
+
+verify_listener() {
+  local pid found="0"
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    if pid_is_xray "${pid}"; then
+      found="1"
+      break
+    fi
+  done < <(get_port_443_pids)
+  [[ "${found}" == "1" ]] || { die "443 端口未由 Xray 监听。"; return 1; }
+}
+
+choose_local_socks_port() {
+  local attempt port
+  for attempt in {1..30}; do
+    port=$((20000 + RANDOM % 30000))
+    if ! ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
+      printf '%s\n' "${port}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_e2e_client() {
+  local config="$1" log_file="$2"
+  run_xray run -config "${config}" >"${log_file}" 2>&1 &
+  E2E_CLIENT_PID="$!"
+}
+
+wait_for_local_port() {
+  local port="$1" attempt
+  for attempt in {1..40}; do
+    if ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
+fetch_ipv4_through_socks() {
+  local port="$1" endpoint candidate
+  for endpoint in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    candidate="$(curl -4 -fsS --socks5-hostname "127.0.0.1:${port}" --connect-timeout 8 --max-time 20 "${endpoint}" 2>/dev/null || true)"
+    candidate="${candidate//$'\r'/}"
+    candidate="${candidate//$'\n'/}"
+    if is_ipv4 "${candidate}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+stop_background_process() {
+  local pid="$1"
+  kill "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+}
+
+run_end_to_end_test() {
+  local temp_dir config log_file socks_port client_pid="" exit_ip="" status=0
+  temp_dir="$(make_temp_dir)"
+  config="${temp_dir}/client.json"
+  log_file="${temp_dir}/client.log"
+  socks_port="$(choose_local_socks_port)" || status=1
+
+  if ((status == 0)); then
+    umask 077
+    command cat >"${config}" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{
+    "listen": "127.0.0.1",
+    "port": ${socks_port},
+    "protocol": "socks",
+    "settings": {"auth": "noauth", "udp": false}
+  }],
+  "outbounds": [{
+    "protocol": "vless",
+    "settings": {"vnext": [{
+      "address": "127.0.0.1",
+      "port": ${XRAY_PORT},
+      "users": [{"id": "${UUID}", "encryption": "none", "flow": "xtls-rprx-vision"}]
+    }]},
+    "streamSettings": {
+      "network": "raw",
+      "security": "reality",
+      "realitySettings": {
+        "serverName": "${REALITY_HOST}",
+        "fingerprint": "chrome",
+        "password": "${PUBLIC_KEY}",
+        "shortId": "${SHORT_ID}",
+        "spiderX": "/"
+      }
+    }
+  }]
+}
+EOF
+    start_e2e_client "${config}" "${log_file}" || status=1
+    client_pid="${E2E_CLIENT_PID:-}"
+  fi
+  if ((status == 0)); then
+    wait_for_local_port "${socks_port}" || status=1
+  fi
+  if ((status == 0)); then
+    exit_ip="$(fetch_ipv4_through_socks "${socks_port}")" || status=1
+  fi
+  if ((status == 0)) && [[ "${exit_ip}" != "${PUBLIC_IPV4}" ]]; then
+    status=1
+  fi
+
+  [[ -z "${client_pid}" ]] || stop_background_process "${client_pid}"
+  rm -rf "${temp_dir}"
+  ((status == 0)) || { die "REALITY/Vision 本地端到端验收失败。"; return 1; }
+}
+
+build_share_uri() {
+  printf 'vless://%s@%s:%s?type=tcp&security=reality&fp=chrome&sni=%s&pbk=%s&sid=%s&spx=%%2F&flow=xtls-rprx-vision#VLESS-REALITY-Vision\n' \
+    "${UUID}" "${PUBLIC_IPV4}" "${XRAY_PORT}" "${REALITY_HOST}" "${PUBLIC_KEY}" "${SHORT_ID}"
+}
+
+write_client_output() {
+  local target="${CLIENT_OUTPUT_PATH:-${CLIENT_OUTPUT}}" target_dir temp_file share_uri
+  target_dir="$(dirname "${target}")"
+  mkdir -p "${target_dir}"
+  temp_file="$(mktemp "${target_dir}/.VLESS-REALITY-Vision.XXXXXX")"
+  share_uri="$(build_share_uri)"
+  umask 077
+  command cat >"${temp_file}" <<EOF
+VLESS + REALITY + Vision
+
+Address: ${PUBLIC_IPV4}
+Port: ${XRAY_PORT}
+UUID: ${UUID}
+Flow: xtls-rprx-vision
+Transport: tcp/raw
+Security: reality
+SNI: ${REALITY_HOST}
+Fingerprint: chrome
+Public key / Password: ${PUBLIC_KEY}
+Private key: ${PRIVATE_KEY}
+Short ID: ${SHORT_ID}
+SpiderX: /
+
+${share_uri}
+EOF
+  chmod 0600 "${temp_file}"
+  mv -f "${temp_file}" "${target}"
+}
+
+restore_backed_up_state() {
+  local path state backup_path current_path
+  local manifest="${BACKUP_PATH_STATE_FILE:-${BACKUP_DIR:-}/path-states.tsv}"
+  [[ -f "${manifest}" ]] || return 0
+  while IFS=$'\t' read -r path state; do
+    case "${path}" in
+      /usr/local/bin/xray | /usr/local/etc/xray | /etc/xray | /etc/v2ray | \
+      /etc/systemd/system/xray.service | /etc/systemd/system/xray@.service | \
+      /etc/systemd/system/xray.service.d | /etc/systemd/system/xray@.service.d)
+        current_path="$(root_path "${path}")"
+        backup_path="${BACKUP_DIR}/files${path}"
+        rm -rf "${current_path}"
+        if [[ "${state}" == "present" ]]; then
+          mkdir -p "$(dirname "${current_path}")"
+          cp -a "${backup_path}" "${current_path}"
+        fi
+        ;;
+    esac
+  done <"${manifest}"
+  run_systemctl daemon-reload || true
+}
+
+rollback() {
+  [[ "${TRANSACTION_ACTIVE:-0}" == "1" ]] || return 0
+  TRANSACTION_ACTIVE="0"
+  set +e
+  run_systemctl stop xray.service
+  restore_backed_up_state
+  restore_service_states
+  set -e
+}
+
+transaction_failed() {
+  rollback
+  return 1
+}
+
+run_install_transaction() {
+  TRANSACTION_ACTIVE="1"
+  trap 'rollback; exit 130' INT TERM
+  quiesce_port_443 || transaction_failed || return
+  install_staged_server_config || transaction_failed || return
+  upgrade_existing_xray || transaction_failed || return
+  activate_xray || transaction_failed || return
+  verify_listener || transaction_failed || return
+  run_end_to_end_test || transaction_failed || return
+  write_client_output || transaction_failed || return
+  TRANSACTION_ACTIVE="0"
+  trap - INT TERM
+}
+
 main() {
-  :
+  preflight || return
+  create_backup_dir || return
+  backup_existing_state || return
+  ensure_xray_binary || return
+  generate_credentials || return
+  render_staged_server_config || return
+  validate_staged_server_config || return
+  run_install_transaction || return
+  log "安装成功。客户端信息已保存到 ${CLIENT_OUTPUT}。"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

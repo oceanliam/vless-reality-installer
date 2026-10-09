@@ -238,6 +238,23 @@ test_previous_client_file_is_preserved() (
   rm -rf "${temp_dir}"
 )
 
+test_backup_records_existing_xray_service_state() (
+  local temp_dir
+  temp_dir="$(mktemp -d)"
+  VRI_ROOT="${temp_dir}/source"
+  BACKUP_ROOT="${temp_dir}/backups"
+  service_unit_exists() { [[ "$1" == 'xray.service' ]]; }
+  service_active_state() { printf 'active\n'; }
+  service_enabled_state() { printf 'enabled\n'; }
+  create_backup_dir
+  backup_existing_state
+  grep -qx $'xray.service\tactive\tenabled' "${SERVICE_STATE_FILE}" || {
+    printf 'existing Xray service state was not recorded'
+    return 1
+  }
+  rm -rf "${temp_dir}"
+)
+
 test_known_systemd_owner_is_stopped_and_disabled() (
   local temp_dir actions=""
   declare -F quiesce_port_443 >/dev/null || { printf 'quiesce_port_443 is not defined'; return 1; }
@@ -453,6 +470,190 @@ test_staged_config_is_validated_in_place() (
   rm -rf "${temp_dir}"
 )
 
+configure_main_fixture() {
+  SCENARIO_LOG="$1"
+  : >"${SCENARIO_LOG}"
+  record_step() { printf '%s\n' "$1" >>"${SCENARIO_LOG}"; }
+  preflight() { PUBLIC_IPV4='203.0.113.10'; record_step preflight; }
+  create_backup_dir() { BACKUP_DIR="$(dirname "${SCENARIO_LOG}")/backup"; SERVICE_STATE_FILE="${BACKUP_DIR}/service-states.tsv"; mkdir -p "${BACKUP_DIR}"; : >"${SERVICE_STATE_FILE}"; record_step create_backup; }
+  backup_existing_state() { record_step backup; }
+  ensure_xray_binary() { XRAY_WAS_PRESENT='1'; record_step ensure_xray; }
+  generate_credentials() {
+    UUID='123e4567-e89b-42d3-a456-426614174000'
+    PRIVATE_KEY="$(printf '%043d' 1)"
+    PUBLIC_KEY="$(printf '%043d' 2)"
+    SHORT_ID='0123456789abcdef'
+    record_step credentials
+  }
+  render_staged_server_config() { STAGED_CONFIG="${BACKUP_DIR}/staged.json"; printf '{}\n' >"${STAGED_CONFIG}"; record_step render; }
+  validate_staged_server_config() { record_step validate; }
+  quiesce_port_443() { record_step quiesce; }
+  install_staged_server_config() { record_step install_config; }
+  upgrade_existing_xray() { record_step upgrade; }
+  activate_xray() { record_step activate; }
+  verify_listener() { record_step listener; }
+  run_end_to_end_test() { record_step e2e; }
+  write_client_output() { record_step output; }
+  restore_backed_up_state() { record_step rollback_files; }
+  restore_service_states() { record_step rollback_services; }
+  run_systemctl() { record_step "systemctl_$1_$2"; }
+  log() { :; }
+}
+
+test_switch_happens_after_config_validation() (
+  local temp_dir sequence
+  declare -F main >/dev/null || { printf 'main is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  configure_main_fixture "${temp_dir}/steps"
+  main
+  sequence="$(paste -sd, "${temp_dir}/steps")"
+  [[ "${sequence}" == *'render,validate,quiesce,install_config'* ]] || { printf 'unsafe transaction order: %s' "${sequence}"; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_existing_xray_upgrade_occurs_after_quiesce() (
+  local temp_dir sequence
+  temp_dir="$(mktemp -d)"
+  configure_main_fixture "${temp_dir}/steps"
+  main
+  sequence="$(paste -sd, "${temp_dir}/steps")"
+  [[ "${sequence}" == *'quiesce,install_config,upgrade,activate'* ]] || { printf 'upgrade order unsafe: %s' "${sequence}"; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+assert_failure_rolls_back() (
+  local failing_step="$1" temp_dir sequence
+  temp_dir="$(mktemp -d)"
+  configure_main_fixture "${temp_dir}/steps"
+  case "${failing_step}" in
+    activate) activate_xray() { record_step activate; return 1; } ;;
+    listener) verify_listener() { record_step listener; return 1; } ;;
+    e2e) run_end_to_end_test() { record_step e2e; return 1; } ;;
+  esac
+  if main >/dev/null 2>&1; then
+    printf '%s failure was accepted' "${failing_step}"
+    return 1
+  fi
+  sequence="$(paste -sd, "${temp_dir}/steps")"
+  [[ "${sequence}" == *'systemctl_stop_xray.service,rollback_files,rollback_services'* ]] || {
+    printf '%s failure did not fully roll back: %s' "${failing_step}" "${sequence}"
+    return 1
+  }
+  [[ "${sequence}" != *',output'* ]] || { printf 'client output written after failure'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_start_failure_restores_config_and_services() (
+  assert_failure_rolls_back activate
+)
+
+test_listener_failure_rolls_back() (
+  assert_failure_rolls_back listener
+)
+
+test_proxy_failure_rolls_back() (
+  assert_failure_rolls_back e2e
+)
+
+test_e2e_client_uses_loopback_and_generated_credentials() (
+  local temp_dir capture
+  declare -F run_end_to_end_test >/dev/null || { printf 'run_end_to_end_test is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  capture="${temp_dir}/captured.json"
+  E2E_FIXTURE_ROOT="${temp_dir}"
+  E2E_CAPTURE="${capture}"
+  PUBLIC_IPV4='203.0.113.10'
+  UUID='123e4567-e89b-42d3-a456-426614174000'
+  PUBLIC_KEY="$(printf '%043d' 3)"
+  SHORT_ID='0123456789abcdef'
+  make_temp_dir() { mkdir -p "${E2E_FIXTURE_ROOT}/runtime"; printf '%s\n' "${E2E_FIXTURE_ROOT}/runtime"; }
+  choose_local_socks_port() { printf '23456\n'; }
+  start_e2e_client() { cp "$1" "${E2E_CAPTURE}"; E2E_CLIENT_PID='999'; }
+  wait_for_local_port() { return 0; }
+  fetch_ipv4_through_socks() { printf '%s\n' "${PUBLIC_IPV4}"; }
+  stop_background_process() { :; }
+  run_end_to_end_test
+  grep -q '"address": "127.0.0.1"' "${capture}" || { printf 'loopback address missing'; return 1; }
+  grep -q '"port": 443' "${capture}" || { printf 'server port missing'; return 1; }
+  grep -q '"serverName": "www.bing.com"' "${capture}" || { printf 'Bing SNI missing'; return 1; }
+  grep -q '"flow": "xtls-rprx-vision"' "${capture}" || { printf 'Vision flow missing'; return 1; }
+  grep -q "${UUID}" "${capture}" || { printf 'UUID missing'; return 1; }
+  grep -q "${PUBLIC_KEY}" "${capture}" || { printf 'public key missing'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_e2e_requires_matching_exit_ipv4() (
+  local temp_dir
+  declare -F run_end_to_end_test >/dev/null || { printf 'run_end_to_end_test is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  E2E_FIXTURE_ROOT="${temp_dir}"
+  PUBLIC_IPV4='203.0.113.10'
+  UUID='123e4567-e89b-42d3-a456-426614174000'
+  PUBLIC_KEY="$(printf '%043d' 4)"
+  SHORT_ID='0123456789abcdef'
+  make_temp_dir() { mkdir -p "${E2E_FIXTURE_ROOT}/runtime"; printf '%s\n' "${E2E_FIXTURE_ROOT}/runtime"; }
+  choose_local_socks_port() { printf '23456\n'; }
+  start_e2e_client() { E2E_CLIENT_PID='999'; }
+  wait_for_local_port() { return 0; }
+  fetch_ipv4_through_socks() { printf '198.51.100.9\n'; }
+  stop_background_process() { :; }
+  run_end_to_end_test >/dev/null 2>&1 && { printf 'mismatched exit IPv4 was accepted'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_e2e_temp_files_are_cleaned() (
+  local temp_dir stopped="no"
+  declare -F run_end_to_end_test >/dev/null || { printf 'run_end_to_end_test is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  E2E_FIXTURE_ROOT="${temp_dir}"
+  PUBLIC_IPV4='203.0.113.10'
+  UUID='123e4567-e89b-42d3-a456-426614174000'
+  PUBLIC_KEY="$(printf '%043d' 5)"
+  SHORT_ID='0123456789abcdef'
+  make_temp_dir() { mkdir -p "${E2E_FIXTURE_ROOT}/runtime"; printf '%s\n' "${E2E_FIXTURE_ROOT}/runtime"; }
+  choose_local_socks_port() { printf '23456\n'; }
+  start_e2e_client() { E2E_CLIENT_PID='999'; }
+  wait_for_local_port() { return 1; }
+  stop_background_process() { stopped="yes"; }
+  run_end_to_end_test >/dev/null 2>&1 && { printf 'failed client startup was accepted'; return 1; }
+  [[ "${stopped}" == 'yes' ]] || { printf 'temporary client was not stopped'; return 1; }
+  [[ ! -d "${temp_dir}/runtime" ]] || { printf 'temporary directory was not removed'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_share_uri_contains_all_generated_values() (
+  local uri
+  declare -F build_share_uri >/dev/null || { printf 'build_share_uri is not defined'; return 1; }
+  PUBLIC_IPV4='203.0.113.10'
+  UUID='123e4567-e89b-42d3-a456-426614174000'
+  PUBLIC_KEY="$(printf '%043d' 6)"
+  SHORT_ID='0123456789abcdef'
+  uri="$(build_share_uri)"
+  [[ "${uri}" == "vless://${UUID}@${PUBLIC_IPV4}:443?"* ]] || { printf 'URI authority invalid'; return 1; }
+  [[ "${uri}" == *"type=tcp&security=reality&fp=chrome&sni=www.bing.com&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&flow=xtls-rprx-vision"* ]] || { printf 'URI query invalid: %s' "${uri}"; return 1; }
+)
+
+test_client_output_is_mode_0600() (
+  local temp_dir target
+  declare -F write_client_output >/dev/null || { printf 'write_client_output is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  target="${temp_dir}/client.txt"
+  CLIENT_OUTPUT_PATH="${target}"
+  PUBLIC_IPV4='203.0.113.10'
+  UUID='123e4567-e89b-42d3-a456-426614174000'
+  PRIVATE_KEY="$(printf '%043d' 7)"
+  PUBLIC_KEY="$(printf '%043d' 8)"
+  SHORT_ID='0123456789abcdef'
+  write_client_output
+  [[ "$(stat -f '%Lp' "${target}" 2>/dev/null || stat -c '%a' "${target}")" == '600' ]] || { printf 'client output mode is not 0600'; return 1; }
+  grep -q '^vless://' "${target}" || { printf 'share URI missing from client output'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_client_output_written_only_after_success() (
+  assert_failure_rolls_back e2e
+)
+
 run_platform_tests() {
   run_isolated_test test_non_root_stops_before_mutation "non-root rejected before mutation"
   run_isolated_test test_rejects_non_systemd "non-systemd rejected before mutation"
@@ -470,6 +671,7 @@ run_backup_tests() {
   run_isolated_test test_backup_uses_unique_utc_directory "backup directories are unique"
   run_isolated_test test_backup_copies_only_declared_paths "backup copies only declared paths"
   run_isolated_test test_previous_client_file_is_preserved "previous client file is preserved"
+  run_isolated_test test_backup_records_existing_xray_service_state "existing Xray service state is backed up"
 }
 
 run_port_tests() {
@@ -489,6 +691,20 @@ run_xray_prepare_tests() {
   run_isolated_test test_two_runs_rotate_all_credentials "repeated runs rotate credentials"
   run_isolated_test test_private_key_never_appears_in_git_files "private key remains outside repository"
   run_isolated_test test_staged_config_is_validated_in_place "staged config is validated in place"
+}
+
+run_transaction_tests() {
+  run_isolated_test test_switch_happens_after_config_validation "switch follows config validation"
+  run_isolated_test test_existing_xray_upgrade_occurs_after_quiesce "existing Xray upgrade follows quiesce"
+  run_isolated_test test_start_failure_restores_config_and_services "start failure rolls back"
+  run_isolated_test test_listener_failure_rolls_back "listener failure rolls back"
+  run_isolated_test test_proxy_failure_rolls_back "proxy failure rolls back"
+  run_isolated_test test_e2e_client_uses_loopback_and_generated_credentials "E2E client uses generated REALITY values"
+  run_isolated_test test_e2e_requires_matching_exit_ipv4 "E2E requires matching exit IPv4"
+  run_isolated_test test_e2e_temp_files_are_cleaned "E2E temporary resources are cleaned"
+  run_isolated_test test_share_uri_contains_all_generated_values "share URI contains all generated values"
+  run_isolated_test test_client_output_is_mode_0600 "client output is mode 0600"
+  run_isolated_test test_client_output_written_only_after_success "client output waits for successful verification"
 }
 
 test_source_does_not_run_main() {
@@ -517,6 +733,9 @@ case "${1:-all}" in
   xray_prepare)
     run_xray_prepare_tests
     ;;
+  transaction)
+    run_transaction_tests
+    ;;
   all)
     test_constants_are_fixed
     test_source_does_not_run_main
@@ -525,6 +744,7 @@ case "${1:-all}" in
     run_backup_tests
     run_port_tests
     run_xray_prepare_tests
+    run_transaction_tests
     ;;
   *)
     fail "test selector" "unknown selector: $1"
