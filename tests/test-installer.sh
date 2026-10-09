@@ -558,6 +558,23 @@ test_proxy_failure_rolls_back() (
   assert_failure_rolls_back e2e
 )
 
+test_unknown_owner_main_aborts_without_rollback_mutation() (
+  local temp_dir sequence
+  temp_dir="$(mktemp -d)"
+  configure_main_fixture "${temp_dir}/steps"
+  quiesce_port_443() { record_step quiesce_unknown; return 1; }
+  if main >/dev/null 2>&1; then
+    printf 'unknown owner failure was accepted'
+    return 1
+  fi
+  sequence="$(paste -sd, "${temp_dir}/steps")"
+  [[ "${sequence}" != *'systemctl_'* && "${sequence}" != *'rollback_files'* && "${sequence}" != *'rollback_services'* ]] || {
+    printf 'unknown owner caused rollback mutation: %s' "${sequence}"
+    return 1
+  }
+  rm -rf "${temp_dir}"
+)
+
 test_e2e_client_uses_loopback_and_generated_credentials() (
   local temp_dir capture
   declare -F run_end_to_end_test >/dev/null || { printf 'run_end_to_end_test is not defined'; return 1; }
@@ -621,6 +638,21 @@ test_e2e_temp_files_are_cleaned() (
   run_end_to_end_test >/dev/null 2>&1 && { printf 'failed client startup was accepted'; return 1; }
   [[ "${stopped}" == 'yes' ]] || { printf 'temporary client was not stopped'; return 1; }
   [[ ! -d "${temp_dir}/runtime" ]] || { printf 'temporary directory was not removed'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_e2e_interrupt_cleanup_removes_active_resources() (
+  local temp_dir stopped="no"
+  declare -F cleanup_e2e_runtime >/dev/null || { printf 'cleanup_e2e_runtime is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  E2E_TEMP_DIR="${temp_dir}/runtime"
+  E2E_CLIENT_PID='999'
+  mkdir -p "${E2E_TEMP_DIR}"
+  printf 'credential material\n' >"${E2E_TEMP_DIR}/client.json"
+  stop_background_process() { [[ "$1" == '999' ]] && stopped='yes'; }
+  cleanup_e2e_runtime
+  [[ "${stopped}" == 'yes' ]] || { printf 'active E2E process not stopped'; return 1; }
+  [[ ! -e "${temp_dir}/runtime" ]] || { printf 'credential directory not removed'; return 1; }
   rm -rf "${temp_dir}"
 )
 
@@ -702,9 +734,11 @@ run_transaction_tests() {
   run_isolated_test test_start_failure_restores_config_and_services "start failure rolls back"
   run_isolated_test test_listener_failure_rolls_back "listener failure rolls back"
   run_isolated_test test_proxy_failure_rolls_back "proxy failure rolls back"
+  run_isolated_test test_unknown_owner_main_aborts_without_rollback_mutation "unknown owner leaves services unchanged"
   run_isolated_test test_e2e_client_uses_loopback_and_generated_credentials "E2E client uses generated REALITY values"
   run_isolated_test test_e2e_requires_matching_exit_ipv4 "E2E requires matching exit IPv4"
   run_isolated_test test_e2e_temp_files_are_cleaned "E2E temporary resources are cleaned"
+  run_isolated_test test_e2e_interrupt_cleanup_removes_active_resources "E2E interruption cleanup removes active resources"
   run_isolated_test test_share_uri_contains_all_generated_values "share URI contains all generated values"
   run_isolated_test test_client_output_is_mode_0600 "client output is mode 0600"
   run_isolated_test test_client_output_written_only_after_success "client output waits for successful verification"

@@ -325,6 +325,9 @@ quiesce_port_443() {
   for unit in "${units[@]}"; do
     capture_service_state "${unit}"
   done
+  if ((${#units[@]} > 0)); then
+    SYSTEM_MUTATED="1"
+  fi
   for unit in "${units[@]}"; do
     run_systemctl stop "${unit}"
     run_systemctl disable "${unit}"
@@ -549,7 +552,7 @@ choose_local_socks_port() {
 
 start_e2e_client() {
   local config="$1" log_file="$2"
-  run_xray run -config "${config}" >"${log_file}" 2>&1 &
+  "${XRAY_BIN:-/usr/local/bin/xray}" run -config "${config}" >"${log_file}" 2>&1 &
   E2E_CLIENT_PID="$!"
 }
 
@@ -584,9 +587,22 @@ stop_background_process() {
   wait "${pid}" 2>/dev/null || true
 }
 
+cleanup_e2e_runtime() {
+  if [[ -n "${E2E_CLIENT_PID:-}" ]]; then
+    stop_background_process "${E2E_CLIENT_PID}"
+    E2E_CLIENT_PID=""
+  fi
+  if [[ -n "${E2E_TEMP_DIR:-}" && "${E2E_TEMP_DIR}" != "/" ]]; then
+    rm -rf "${E2E_TEMP_DIR}"
+    E2E_TEMP_DIR=""
+  fi
+}
+
 run_end_to_end_test() {
-  local temp_dir config log_file socks_port client_pid="" exit_ip="" status=0
+  local temp_dir config log_file socks_port exit_ip="" status=0
   temp_dir="$(make_temp_dir)"
+  E2E_TEMP_DIR="${temp_dir}"
+  E2E_CLIENT_PID=""
   config="${temp_dir}/client.json"
   log_file="${temp_dir}/client.log"
   socks_port="$(choose_local_socks_port)" || status=1
@@ -624,7 +640,6 @@ run_end_to_end_test() {
 }
 EOF
     start_e2e_client "${config}" "${log_file}" || status=1
-    client_pid="${E2E_CLIENT_PID:-}"
   fi
   if ((status == 0)); then
     wait_for_local_port "${socks_port}" || status=1
@@ -636,8 +651,7 @@ EOF
     status=1
   fi
 
-  [[ -z "${client_pid}" ]] || stop_background_process "${client_pid}"
-  rm -rf "${temp_dir}"
+  cleanup_e2e_runtime
   ((status == 0)) || { die "REALITY/Vision 本地端到端验收失败。"; return 1; }
 }
 
@@ -700,6 +714,7 @@ restore_backed_up_state() {
 rollback() {
   [[ "${TRANSACTION_ACTIVE:-0}" == "1" ]] || return 0
   TRANSACTION_ACTIVE="0"
+  [[ "${SYSTEM_MUTATED:-0}" == "1" ]] || return 0
   set +e
   run_systemctl stop xray.service
   restore_backed_up_state
@@ -714,8 +729,10 @@ transaction_failed() {
 
 run_install_transaction() {
   TRANSACTION_ACTIVE="1"
-  trap 'rollback; exit 130' INT TERM
+  SYSTEM_MUTATED="0"
+  trap 'cleanup_e2e_runtime; rollback; exit 130' INT TERM
   quiesce_port_443 || transaction_failed || return
+  SYSTEM_MUTATED="1"
   install_staged_server_config || transaction_failed || return
   upgrade_existing_xray || transaction_failed || return
   activate_xray || transaction_failed || return
