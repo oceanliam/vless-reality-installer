@@ -188,6 +188,139 @@ test_public_ipv4_rejects_invalid_output() (
   fi
 )
 
+test_backup_uses_unique_utc_directory() (
+  local temp_dir first second
+  declare -F create_backup_dir >/dev/null || { printf 'create_backup_dir is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  BACKUP_ROOT="${temp_dir}/backups"
+  utc_timestamp() { printf '20261009T010203Z\n'; }
+  create_backup_dir
+  first="${BACKUP_DIR}"
+  create_backup_dir
+  second="${BACKUP_DIR}"
+  [[ "${first}" != "${second}" ]] || { printf 'backup directories collided'; return 1; }
+  [[ -d "${first}" && -d "${second}" ]] || { printf 'backup directory missing'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_backup_copies_only_declared_paths() (
+  local temp_dir
+  declare -F backup_existing_state >/dev/null || { printf 'backup_existing_state is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  VRI_ROOT="${temp_dir}/source"
+  BACKUP_ROOT="${temp_dir}/backups"
+  mkdir -p "${VRI_ROOT}/usr/local/etc/xray" "${VRI_ROOT}/var/log/xray" "${VRI_ROOT}/var/www/site"
+  printf 'config' >"${VRI_ROOT}/usr/local/etc/xray/config.json"
+  printf 'secret log' >"${VRI_ROOT}/var/log/xray/access.log"
+  printf 'website' >"${VRI_ROOT}/var/www/site/index.html"
+  create_backup_dir
+  backup_existing_state
+  [[ -f "${BACKUP_DIR}/files/usr/local/etc/xray/config.json" ]] || { printf 'declared config not copied'; return 1; }
+  [[ ! -e "${BACKUP_DIR}/files/var/log/xray/access.log" ]] || { printf 'log was copied'; return 1; }
+  [[ ! -e "${BACKUP_DIR}/files/var/www/site/index.html" ]] || { printf 'website data was copied'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_previous_client_file_is_preserved() (
+  local temp_dir
+  declare -F backup_existing_state >/dev/null || { printf 'backup_existing_state is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  VRI_ROOT="${temp_dir}/source"
+  BACKUP_ROOT="${temp_dir}/backups"
+  mkdir -p "${VRI_ROOT}/root"
+  printf 'old-link' >"${VRI_ROOT}${CLIENT_OUTPUT}"
+  create_backup_dir
+  backup_existing_state
+  [[ "$(cat "${BACKUP_DIR}/files/root/VLESS-REALITY-Vision.txt")" == "old-link" ]] || {
+    printf 'previous client file was not preserved'
+    return 1
+  }
+  rm -rf "${temp_dir}"
+)
+
+test_known_systemd_owner_is_stopped_and_disabled() (
+  local temp_dir actions=""
+  declare -F quiesce_port_443 >/dev/null || { printf 'quiesce_port_443 is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  BACKUP_DIR="${temp_dir}"
+  SERVICE_STATE_FILE="${temp_dir}/service-states.tsv"
+  get_port_443_pids() { printf '111\n'; }
+  systemd_unit_for_pid() { printf 'nginx.service\n'; }
+  service_active_state() { printf 'active\n'; }
+  service_enabled_state() { printf 'enabled\n'; }
+  run_systemctl() { actions+="$*|"; }
+  quiesce_port_443
+  [[ "${actions}" == "stop nginx.service|disable nginx.service|" ]] || { printf 'unexpected actions: %s' "${actions}"; return 1; }
+  grep -qx $'nginx.service\tactive\tenabled' "${SERVICE_STATE_FILE}" || { printf 'service state not recorded'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_multiple_systemd_owners_are_recorded() (
+  local temp_dir
+  declare -F quiesce_port_443 >/dev/null || { printf 'quiesce_port_443 is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  BACKUP_DIR="${temp_dir}"
+  SERVICE_STATE_FILE="${temp_dir}/service-states.tsv"
+  get_port_443_pids() { printf '111\n222\n'; }
+  systemd_unit_for_pid() { [[ "$1" == "111" ]] && printf 'nginx.service\n' || printf 'caddy.service\n'; }
+  service_active_state() { printf 'active\n'; }
+  service_enabled_state() { printf 'enabled\n'; }
+  run_systemctl() { :; }
+  quiesce_port_443
+  [[ "$(wc -l <"${SERVICE_STATE_FILE}" | tr -d ' ')" == "2" ]] || { printf 'expected two recorded services'; return 1; }
+  grep -q '^nginx.service' "${SERVICE_STATE_FILE}" || { printf 'nginx missing'; return 1; }
+  grep -q '^caddy.service' "${SERVICE_STATE_FILE}" || { printf 'caddy missing'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_unknown_owner_aborts_without_kill() (
+  local temp_dir actions="" output
+  declare -F quiesce_port_443 >/dev/null || { printf 'quiesce_port_443 is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  BACKUP_DIR="${temp_dir}"
+  SERVICE_STATE_FILE="${temp_dir}/service-states.tsv"
+  get_port_443_pids() { printf '333\n'; }
+  systemd_unit_for_pid() { return 1; }
+  process_name_for_pid() { printf 'custom-daemon\n'; }
+  run_systemctl() { actions+="$*|"; }
+  if quiesce_port_443 >"${temp_dir}/output" 2>&1; then
+    printf 'unknown owner was accepted'
+    return 1
+  fi
+  output="$(cat "${temp_dir}/output")"
+  [[ -z "${actions}" ]] || { printf 'systemctl was called'; return 1; }
+  [[ "${output}" == *'333'* && "${output}" == *'custom-daemon'* ]] || { printf 'PID/process not reported'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_ssh_unit_is_never_stopped() (
+  local temp_dir actions=""
+  declare -F quiesce_port_443 >/dev/null || { printf 'quiesce_port_443 is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  BACKUP_DIR="${temp_dir}"
+  SERVICE_STATE_FILE="${temp_dir}/service-states.tsv"
+  get_port_443_pids() { printf '444\n'; }
+  systemd_unit_for_pid() { printf 'sshd.service\n'; }
+  process_name_for_pid() { printf 'sshd\n'; }
+  run_systemctl() { actions+="$*|"; }
+  quiesce_port_443 >/dev/null 2>&1 && { printf 'SSH owner was accepted'; return 1; }
+  [[ -z "${actions}" ]] || { printf 'SSH service was changed'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
+test_restore_service_states_exactly() (
+  local temp_dir actions=""
+  declare -F restore_service_states >/dev/null || { printf 'restore_service_states is not defined'; return 1; }
+  temp_dir="$(mktemp -d)"
+  SERVICE_STATE_FILE="${temp_dir}/service-states.tsv"
+  printf 'nginx.service\tactive\tenabled\ncaddy.service\tinactive\tdisabled\n' >"${SERVICE_STATE_FILE}"
+  run_systemctl() { actions+="$*|"; }
+  restore_service_states
+  [[ "${actions}" == *'enable nginx.service|'* && "${actions}" == *'start nginx.service|'* ]] || { printf 'nginx state not restored'; return 1; }
+  [[ "${actions}" == *'disable caddy.service|'* && "${actions}" == *'stop caddy.service|'* ]] || { printf 'caddy state not restored'; return 1; }
+  rm -rf "${temp_dir}"
+)
+
 run_platform_tests() {
   run_isolated_test test_non_root_stops_before_mutation "non-root rejected before mutation"
   run_isolated_test test_rejects_non_systemd "non-systemd rejected before mutation"
@@ -199,6 +332,20 @@ run_network_tests() {
   run_isolated_test test_github_failure_precedes_port_switch "GitHub failure precedes port switch"
   run_isolated_test test_bing_must_support_tls13 "Bing TLS 1.3 required"
   run_isolated_test test_public_ipv4_rejects_invalid_output "invalid public IPv4 rejected"
+}
+
+run_backup_tests() {
+  run_isolated_test test_backup_uses_unique_utc_directory "backup directories are unique"
+  run_isolated_test test_backup_copies_only_declared_paths "backup copies only declared paths"
+  run_isolated_test test_previous_client_file_is_preserved "previous client file is preserved"
+}
+
+run_port_tests() {
+  run_isolated_test test_known_systemd_owner_is_stopped_and_disabled "known systemd owner is quiesced"
+  run_isolated_test test_multiple_systemd_owners_are_recorded "multiple systemd owners are recorded"
+  run_isolated_test test_unknown_owner_aborts_without_kill "unknown owner aborts without kill"
+  run_isolated_test test_ssh_unit_is_never_stopped "SSH unit is protected"
+  run_isolated_test test_restore_service_states_exactly "service states restore exactly"
 }
 
 test_source_does_not_run_main() {
@@ -218,11 +365,19 @@ case "${1:-all}" in
   preflight_network)
     run_network_tests
     ;;
+  backup)
+    run_backup_tests
+    ;;
+  port)
+    run_port_tests
+    ;;
   all)
     test_constants_are_fixed
     test_source_does_not_run_main
     run_platform_tests
     run_network_tests
+    run_backup_tests
+    run_port_tests
     ;;
   *)
     fail "test selector" "unknown selector: $1"

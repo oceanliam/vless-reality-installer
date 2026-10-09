@@ -167,6 +167,171 @@ preflight() {
   check_reality_target
 }
 
+utc_timestamp() {
+  date -u +%Y%m%dT%H%M%SZ
+}
+
+root_path() {
+  printf '%s%s\n' "${VRI_ROOT:-}" "$1"
+}
+
+create_backup_dir() {
+  local backup_root="${BACKUP_ROOT:-/root/vless-reality-installer-backups}"
+  local timestamp candidate suffix=0
+
+  timestamp="$(utc_timestamp)"
+  candidate="${backup_root}/${timestamp}"
+  while [[ -e "${candidate}" ]]; do
+    suffix=$((suffix + 1))
+    candidate="${backup_root}/${timestamp}-$(printf '%02d' "${suffix}")"
+  done
+  mkdir -p "${candidate}/files"
+  BACKUP_DIR="${candidate}"
+  SERVICE_STATE_FILE="${BACKUP_DIR}/service-states.tsv"
+  : >"${SERVICE_STATE_FILE}"
+}
+
+backup_one_path() {
+  local absolute_path="$1"
+  local source_path destination
+
+  source_path="$(root_path "${absolute_path}")"
+  [[ -e "${source_path}" || -L "${source_path}" ]] || return 0
+  destination="${BACKUP_DIR}/files${absolute_path}"
+  mkdir -p "$(dirname "${destination}")"
+  cp -a "${source_path}" "${destination}"
+}
+
+backup_existing_state() {
+  local path
+  local -a paths=(
+    /usr/local/etc/xray
+    /usr/local/bin/xray
+    /etc/xray
+    /etc/v2ray
+    /etc/systemd/system/xray.service
+    /etc/systemd/system/xray@.service
+    /etc/systemd/system/xray.service.d
+    /etc/systemd/system/xray@.service.d
+    /etc/nginx
+    /etc/caddy
+    /etc/httpd
+    /etc/apache2
+    "${CLIENT_OUTPUT}"
+  )
+
+  [[ -n "${BACKUP_DIR:-}" ]] || { die "未创建备份目录。"; return 1; }
+  for path in "${paths[@]}"; do
+    backup_one_path "${path}"
+  done
+}
+
+run_systemctl() {
+  systemctl "$@"
+}
+
+get_port_443_pids() {
+  ss -H -ltnp "sport = :${XRAY_PORT}" 2>/dev/null \
+    | grep -oE 'pid=[0-9]+' \
+    | cut -d= -f2 \
+    | sort -n -u || true
+}
+
+systemd_unit_for_pid() {
+  local pid="$1" proc_root="${PROC_ROOT:-/proc}" unit verified
+  local cgroup_file="${proc_root}/${pid}/cgroup"
+
+  [[ -r "${cgroup_file}" ]] || return 1
+  unit="$(grep -oE '[^/[:space:]]+\.service' "${cgroup_file}" | tail -n 1)"
+  [[ -n "${unit}" && "${unit}" == *.service ]] || return 1
+  verified="$(run_systemctl show --property=Id --value "${unit}" 2>/dev/null)" || return 1
+  [[ "${verified}" == "${unit}" ]] || return 1
+  printf '%s\n' "${unit}"
+}
+
+process_name_for_pid() {
+  local pid="$1" proc_root="${PROC_ROOT:-/proc}"
+  if [[ -r "${proc_root}/${pid}/comm" ]]; then
+    head -n 1 "${proc_root}/${pid}/comm"
+  else
+    ps -p "${pid}" -o comm= 2>/dev/null || printf 'unknown\n'
+  fi
+}
+
+service_active_state() {
+  run_systemctl is-active "$1" 2>/dev/null || true
+}
+
+service_enabled_state() {
+  run_systemctl is-enabled "$1" 2>/dev/null || true
+}
+
+capture_service_state() {
+  local unit="$1" active enabled
+  [[ -n "${SERVICE_STATE_FILE:-}" ]] || { die "服务状态文件未初始化。"; return 1; }
+  if grep -Fq "${unit}"$'\t' "${SERVICE_STATE_FILE}" 2>/dev/null; then
+    return 0
+  fi
+  active="$(service_active_state "${unit}")"
+  enabled="$(service_enabled_state "${unit}")"
+  [[ -n "${active}" ]] || active="inactive"
+  [[ -n "${enabled}" ]] || enabled="disabled"
+  printf '%s\t%s\t%s\n' "${unit}" "${active}" "${enabled}" >>"${SERVICE_STATE_FILE}"
+}
+
+quiesce_port_443() {
+  local pid unit name existing
+  local -a pids=() units=()
+
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] && pids+=("${pid}")
+  done < <(get_port_443_pids)
+
+  for pid in "${pids[@]}"; do
+    unit="$(systemd_unit_for_pid "${pid}" 2>/dev/null || true)"
+    name="$(process_name_for_pid "${pid}" 2>/dev/null || printf 'unknown')"
+    if [[ -z "${unit}" ]]; then
+      die "443 端口由未知非 systemd 进程占用: PID=${pid}, process=${name}。"
+      return 1
+    fi
+    if [[ "${unit}" == "ssh.service" || "${unit}" == "sshd.service" ]]; then
+      die "拒绝停止 SSH 服务 ${unit} (PID=${pid})。"
+      return 1
+    fi
+    existing=" no "
+    if ((${#units[@]} > 0)); then
+      existing=" ${units[*]} "
+    fi
+    [[ "${existing}" == *" ${unit} "* ]] || units+=("${unit}")
+  done
+
+  for unit in "${units[@]}"; do
+    capture_service_state "${unit}"
+  done
+  for unit in "${units[@]}"; do
+    run_systemctl stop "${unit}"
+    run_systemctl disable "${unit}"
+  done
+}
+
+restore_service_states() {
+  local unit active enabled
+  [[ -f "${SERVICE_STATE_FILE:-}" ]] || return 0
+  while IFS=$'\t' read -r unit active enabled; do
+    [[ -n "${unit}" ]] || continue
+    case "${enabled}" in
+      enabled) run_systemctl enable "${unit}" ;;
+      disabled) run_systemctl disable "${unit}" ;;
+      masked) run_systemctl mask "${unit}" ;;
+    esac
+    if [[ "${active}" == "active" ]]; then
+      run_systemctl start "${unit}"
+    else
+      run_systemctl stop "${unit}"
+    fi
+  done <"${SERVICE_STATE_FILE}"
+}
+
 main() {
   :
 }
